@@ -328,7 +328,7 @@ def filter_manifests_by_age(repositories: Dict[str, List[Dict]], threshold_days:
 
 def get_images_in_use_by_app_services(web_client: WebSiteManagementClient,
                                        subscription_id: str,
-                                       acr_name: str) -> Set[str]:
+                                       acr_name: str) -> Tuple[Set[str], Dict[str, List[str]]]:
     """
     Scans all App Services (including deployment slots) in the subscription
     to identify which ACR images are currently in use.
@@ -339,13 +339,16 @@ def get_images_in_use_by_app_services(web_client: WebSiteManagementClient,
         acr_name: Name of the ACR to filter images
 
     Returns:
-        Set of image references in use (format: repository@digest or repository:tag)
+        Tuple of (Set of image references, Dict mapping image references to app service names)
+        Image references format: repository@digest or repository:tag
+        App service names format: "app-name" for production, "app-name/slot-name" for slots
     """
     print("=" * 80)
     print("SCANNING APP SERVICES FOR IN-USE IMAGES")
     print("=" * 80)
 
     images_in_use = set()
+    image_to_apps = defaultdict(list)  # Maps image reference to list of app services
     acr_login_server = f"{acr_name}.azurecr.io"
 
     try:
@@ -373,6 +376,7 @@ def get_images_in_use_by_app_services(web_client: WebSiteManagementClient,
 
                 if image:
                     images_in_use.add(image)
+                    image_to_apps[image].append(app_name)
                     print(f"  ✓ Production slot uses: {image}")
                 else:
                     print(f"  - No ACR image found in production slot")
@@ -400,6 +404,8 @@ def get_images_in_use_by_app_services(web_client: WebSiteManagementClient,
 
                             if slot_image:
                                 images_in_use.add(slot_image)
+                                slot_full_name = f"{app_name}/{slot_name}"
+                                image_to_apps[slot_image].append(slot_full_name)
                                 print(f"    ✓ Slot '{slot_name}' uses: {slot_image}")
                             else:
                                 print(f"    - Slot '{slot_name}' has no ACR image")
@@ -415,7 +421,7 @@ def get_images_in_use_by_app_services(web_client: WebSiteManagementClient,
         print(f"✓ Total unique ACR images in use: {len(images_in_use)}")
         print()
 
-        return images_in_use
+        return images_in_use, dict(image_to_apps)
 
     except AzureError as e:
         print(f"\nERROR: Failed to scan App Services: {e}")
@@ -481,23 +487,26 @@ def extract_acr_image_from_config(config, acr_login_server: str, app_settings=No
     return ''
 
 
-def resolve_images_to_manifests(images_in_use: Set[str], acr_name: str) -> Set[str]:
+def resolve_images_to_manifests(images_in_use: Set[str], image_to_apps: Dict[str, List[str]], acr_name: str) -> Tuple[Set[str], Dict[str, List[str]]]:
     """
     Converts image references (which may use tags) to manifest digests.
     This ensures we're comparing at the manifest level, not tag level.
+    Also maintains the mapping of which app services use which digests.
 
     Args:
         images_in_use: Set of image references from App Services
+        image_to_apps: Dict mapping image references to app service names
         acr_name: Name of the ACR
 
     Returns:
-        Set of manifest digests (sha256:...)
+        Tuple of (Set of manifest digests, Dict mapping digests to app service names)
     """
     print("=" * 80)
     print("RESOLVING IMAGE REFERENCES TO MANIFEST DIGESTS")
     print("=" * 80)
 
     manifest_digests = set()
+    digest_to_apps = defaultdict(list)  # Maps digest to list of app services
     acr_login_server = f"{acr_name}.azurecr.io"
 
     for image_ref in images_in_use:
@@ -515,6 +524,9 @@ def resolve_images_to_manifests(images_in_use: Set[str], acr_name: str) -> Set[s
         if '@sha256:' in image_part:
             digest = image_part.split('@')[1].lower()  # Normalize to lowercase
             manifest_digests.add(digest)
+            # Map digest to app services
+            if image_ref in image_to_apps:
+                digest_to_apps[digest].extend(image_to_apps[image_ref])
             print(f"  ✓ Already a digest: {digest[:12]}...")
             continue
 
@@ -540,7 +552,11 @@ def resolve_images_to_manifests(images_in_use: Set[str], acr_name: str) -> Set[s
             digest = manifest_info.get('digest', '')
 
             if digest:
-                manifest_digests.add(digest.lower())  # Normalize to lowercase
+                digest = digest.lower()  # Normalize to lowercase
+                manifest_digests.add(digest)
+                # Map digest to app services
+                if image_ref in image_to_apps:
+                    digest_to_apps[digest].extend(image_to_apps[image_ref])
                 print(f"  ✓ Resolved to digest: {digest[:12]}...")
             else:
                 print(f"  Warning: Could not resolve to digest")
@@ -554,7 +570,7 @@ def resolve_images_to_manifests(images_in_use: Set[str], acr_name: str) -> Set[s
     print(f"✓ Resolved {len(manifest_digests)} unique manifest digests in use")
     print()
 
-    return manifest_digests
+    return manifest_digests, dict(digest_to_apps)
 
 
 # ============================================================================
@@ -562,22 +578,26 @@ def resolve_images_to_manifests(images_in_use: Set[str], acr_name: str) -> Set[s
 # ============================================================================
 
 def identify_unused_manifests(old_repositories: Dict[str, List[Dict]],
-                               manifests_in_use: Set[str]) -> List[Dict]:
+                               manifests_in_use: Set[str],
+                               digest_to_apps: Dict[str, List[str]]) -> Tuple[List[Dict], List[Dict]]:
     """
     Compares old manifests against those in use to identify candidates for deletion.
+    Also identifies old manifests that are still in use (for warning purposes).
 
     Args:
         old_repositories: Dictionary of repositories with old manifests
         manifests_in_use: Set of manifest digests currently in use
+        digest_to_apps: Dict mapping digests to app service names
 
     Returns:
-        List of unused manifest dictionaries
+        Tuple of (List of unused manifests, List of old manifests in use with app info)
     """
     print("=" * 80)
     print("IDENTIFYING UNUSED MANIFESTS")
     print("=" * 80)
 
     unused_manifests = []
+    old_manifests_in_use = []
 
     for repo, manifests in old_repositories.items():
         print(f"Analyzing repository: {repo}")
@@ -590,15 +610,114 @@ def identify_unused_manifests(old_repositories: Dict[str, List[Dict]],
                 tags_str = ', '.join(manifest['tags'])
                 print(f"  ✗ UNUSED: {digest[:12]}... (tags: {tags_str})")
             else:
+                # This old manifest is in use - track it for warnings
+                manifest_with_apps = manifest.copy()
+                manifest_with_apps['used_by_apps'] = digest_to_apps.get(digest, [])
+                old_manifests_in_use.append(manifest_with_apps)
+
                 tags_str = ', '.join(manifest['tags'])
                 print(f"  ✓ IN USE: {digest[:12]}... (tags: {tags_str})")
 
         print()
 
     print(f"✓ Found {len(unused_manifests)} unused manifests eligible for deletion")
+    if old_manifests_in_use:
+        print(f"⚠ Found {len(old_manifests_in_use)} old manifests still in use by App Services")
     print()
 
-    return unused_manifests
+    return unused_manifests, old_manifests_in_use
+
+
+# ============================================================================
+# OLD MANIFESTS IN USE WARNING
+# ============================================================================
+
+def display_old_manifests_warning(old_manifests_in_use: List[Dict], threshold_days: int):
+    """
+    Displays warning-level messages for old manifests that are still in use by App Services.
+    Provides metrics and recommendations for updating these manifests.
+
+    Args:
+        old_manifests_in_use: List of old manifest dictionaries with app service info
+        threshold_days: Age threshold in days
+    """
+    if not old_manifests_in_use:
+        return
+
+    print("=" * 80)
+    print("⚠ WARNING: OLD MANIFESTS STILL IN USE BY APP SERVICES")
+    print("=" * 80)
+    print()
+    print(f"The following {len(old_manifests_in_use)} manifest(s) are older than {threshold_days} days")
+    print("but are still being used by App Services and will NOT be deleted.")
+    print()
+    print("RECOMMENDATION: Consider updating these App Services to use newer images.")
+    print("=" * 80)
+    print()
+
+    # Group by repository for cleaner display
+    by_repo = defaultdict(list)
+    for manifest in old_manifests_in_use:
+        by_repo[manifest['repository']].append(manifest)
+
+    total_size_bytes = 0
+    max_age_days = 0
+
+    for repo in sorted(by_repo.keys()):
+        print(f"Repository: {repo}")
+        print("-" * 80)
+
+        # Sort manifests from oldest to newest
+        sorted_manifests = sorted(by_repo[repo], key=lambda m: m['created_time'])
+
+        for manifest in sorted_manifests:
+            digest = manifest['digest']
+            tags = ', '.join(manifest['tags'])
+            created_time = manifest['created_time']
+            size_mb = manifest['size_bytes'] / (1024 * 1024)
+            total_size_bytes += manifest['size_bytes']
+            used_by_apps = manifest.get('used_by_apps', [])
+
+            age_days = (datetime.now(timezone.utc) - created_time).days
+            max_age_days = max(max_age_days, age_days)
+            days_over_threshold = age_days - threshold_days
+
+            print(f"  Digest:   {digest}")
+            print(f"  Tags:     {tags}")
+            print(f"  Created:  {created_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            print(f"  Age:      {age_days} days old (⚠ {days_over_threshold} days over threshold)")
+            print(f"  Size:     {size_mb:.2f} MB")
+            print(f"  Used by:  {len(used_by_apps)} App Service(s)")
+
+            for app in sorted(used_by_apps):
+                print(f"            - {app}")
+
+            print()
+
+        print()
+
+    total_size_mb = total_size_bytes / (1024 * 1024)
+    total_size_gb = total_size_bytes / (1024 * 1024 * 1024)
+    avg_age = sum((datetime.now(timezone.utc) - m['created_time']).days for m in old_manifests_in_use) / len(old_manifests_in_use)
+
+    print("=" * 80)
+    print("OLD MANIFESTS IN USE - SUMMARY METRICS")
+    print("=" * 80)
+    print(f"Total old manifests in use:          {len(old_manifests_in_use)}")
+    print(f"Total size of old images:            {total_size_gb:.2f} GB ({total_size_mb:.2f} MB)")
+    print(f"Oldest manifest age:                 {max_age_days} days")
+    print(f"Average age:                         {avg_age:.1f} days")
+    print(f"Threshold exceeded by (oldest):      {max_age_days - threshold_days} days")
+    print(f"Total App Services affected:         {len(set(app for m in old_manifests_in_use for app in m.get('used_by_apps', [])))}")
+    print("=" * 80)
+    print()
+    print("RECOMMENDATIONS:")
+    print("  1. Review and update App Services to use newer image versions")
+    print("  2. Consider implementing automated image update policies")
+    print("  3. Set up monitoring/alerts for image age in production environments")
+    print("  4. Review the audit log for detailed information on affected services")
+    print("=" * 80)
+    print()
 
 
 # ============================================================================
@@ -918,6 +1037,7 @@ def write_audit_log(
     start_time: datetime,
     end_time: datetime,
     unused_manifests: List[Dict],
+    old_manifests_in_use: List[Dict],
     deletion_results: Optional[Dict] = None,
     images_in_use_count: int = 0,
     total_manifests_scanned: int = 0,
@@ -934,6 +1054,7 @@ def write_audit_log(
         start_time: Script start time
         end_time: Script end time
         unused_manifests: List of unused manifest dictionaries
+        old_manifests_in_use: List of old manifests still in use with app service info
         deletion_results: Results from hard delete (if applicable)
         images_in_use_count: Number of images found in use
         total_manifests_scanned: Total number of manifests scanned
@@ -981,8 +1102,11 @@ def write_audit_log(
             'manifests_older_than_threshold': old_manifests_count,
             'images_in_use': images_in_use_count,
             'unused_manifests_identified': manifest_count,
+            'old_manifests_still_in_use': len(old_manifests_in_use),
+            'old_manifests_still_in_use_warning': 'These manifests are older than threshold but protected from deletion' if old_manifests_in_use else None,
         },
-        'manifests': []
+        'manifests': [],
+        'old_manifests_in_use': []
     }
 
     # Sort manifests by creation time (oldest to newest) regardless of repository
@@ -1008,6 +1132,32 @@ def write_audit_log(
             manifest_data['deletion_result'] = deletion_results[manifest['digest']]
 
         audit_data['manifests'].append(manifest_data)
+
+    # Add old manifests in use information
+    if old_manifests_in_use:
+        # Sort by age (oldest first)
+        sorted_old_manifests = sorted(
+            old_manifests_in_use,
+            key=lambda m: m['created_time'] if m['created_time'] else datetime.min.replace(tzinfo=timezone.utc)
+        )
+
+        for manifest in sorted_old_manifests:
+            old_manifest_data = {
+                'repository': manifest['repository'],
+                'digest': manifest['digest'],
+                'tags': manifest['tags'],
+                'created_time': manifest['created_time'].isoformat() if manifest['created_time'] else None,
+                'age_days': (datetime.now(timezone.utc) - manifest['created_time']).days if manifest['created_time'] else None,
+                'days_over_threshold': ((datetime.now(timezone.utc) - manifest['created_time']).days - IMAGE_AGE_THRESHOLD_DAYS) if manifest['created_time'] else None,
+                'size_bytes': manifest['size_bytes'],
+                'size_mb': round(manifest['size_bytes'] / (1024 * 1024), 2),
+                'used_by_app_services': manifest.get('used_by_apps', []),
+                'app_service_count': len(manifest.get('used_by_apps', [])),
+                'status': 'protected_from_deletion',
+                'warning': f'This manifest is {(datetime.now(timezone.utc) - manifest["created_time"]).days} days old, exceeding the {IMAGE_AGE_THRESHOLD_DAYS}-day threshold'
+            }
+
+            audit_data['old_manifests_in_use'].append(old_manifest_data)
 
     # Add deletion summary for hard delete mode
     if deletion_mode == 'hard' and deletion_results:
@@ -1079,18 +1229,21 @@ def main():
         return
 
     # Step 5: Scan App Services to find images in use
-    images_in_use = get_images_in_use_by_app_services(web_client, subscription_id, acr_name)
+    images_in_use, image_to_apps = get_images_in_use_by_app_services(web_client, subscription_id, acr_name)
 
     # Step 6: Resolve image references to manifest digests
-    manifests_in_use = resolve_images_to_manifests(images_in_use, acr_name)
+    manifests_in_use, digest_to_apps = resolve_images_to_manifests(images_in_use, image_to_apps, acr_name)
 
-    # Step 7: Identify unused manifests
-    unused_manifests = identify_unused_manifests(old_repositories, manifests_in_use)
+    # Step 7: Identify unused manifests and old manifests still in use
+    unused_manifests, old_manifests_in_use = identify_unused_manifests(old_repositories, manifests_in_use, digest_to_apps)
 
     # Step 8: Display summary
     display_unused_manifests_summary(unused_manifests)
 
-    # Step 9: Select deletion mode and execute
+    # Step 9: Display warnings for old manifests still in use
+    display_old_manifests_warning(old_manifests_in_use, IMAGE_AGE_THRESHOLD_DAYS)
+
+    # Step 10: Select deletion mode and execute
     deletion_mode = None
     deletion_results = None
 
@@ -1111,7 +1264,7 @@ def main():
     end_time = datetime.now(timezone.utc)
 
     # Write audit log if deletion mode was executed
-    if deletion_mode and unused_manifests:
+    if deletion_mode and (unused_manifests or old_manifests_in_use):
         try:
             audit_file = write_audit_log(
                 deletion_mode=deletion_mode,
@@ -1121,6 +1274,7 @@ def main():
                 start_time=start_time,
                 end_time=end_time,
                 unused_manifests=unused_manifests,
+                old_manifests_in_use=old_manifests_in_use,
                 deletion_results=deletion_results,
                 images_in_use_count=len(images_in_use),
                 total_manifests_scanned=total_manifests_scanned,
