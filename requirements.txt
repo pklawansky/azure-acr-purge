@@ -1,0 +1,14 @@
+# Azure Container Registry Cleanup Script - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Azure Identity - Service Principal Authentication
+azure-identity>=1.12.0
+
+# Azure Management SDK - Container Registry
+azure-mgmt-containerregistry>=10.1.0
+
+# Azure Management SDK - Web Apps (App Services)
+azure-mgmt-web>=7.0.0
+
+# Azure Core for exception handling
+azure-core>=1.26.0
